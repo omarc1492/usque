@@ -1,12 +1,13 @@
 package cmd
 
 import (
-	"golang.zx2c4.com/wireguard/tun/netstack"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"testing"
 	"time"
+
+	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 func TestHTTPProxyDoesNotSendProxyCredentialsToOrigin(t *testing.T) {
