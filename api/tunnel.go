@@ -148,12 +148,6 @@ func NewWaterAdapter(iface *water.Interface) TunnelDevice {
 	return &WaterAdapter{iface: iface}
 }
 
-// pumpShutdownGrace bounds how long the supervisor waits for both forwarding
-// pumps to exit after an error before spawning a fresh pair. A device-side
-// pump may still be parked in a blocking TUN read during this window; the
-// readMu serializes any overlap with the next cycle's device reader.
-const pumpShutdownGrace = 2 * time.Second
-
 // CONNECT-IP context ID 0 is encoded as a one-byte QUIC varint. Reserving this
 // byte before packets lets connect-ip-go send outbound datagrams in place.
 const datagramContextIDHeadroom = 1
@@ -230,28 +224,42 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 	}
 
 	packetBufferPool := NewNetBuffer(cfg.MTU + datagramContextIDHeadroom)
-	packetBufferChan := make(chan []byte, 1)
+	readerCtx, stopReader := context.WithCancel(context.Background())
+	defer stopReader()
+	// Match netstack's bounded egress queue. Never block its device reader:
+	// injecting an incoming packet can synchronously wait for another read.
+	packetBufferChan := make(chan []byte, 1024)
+	readerErrors := make(chan error, 1)
 	go func() {
 		for {
-			if ctx.Err() != nil {
-				return
-			}
 			buf := packetBufferPool.Get()
 			n, err := cfg.Device.ReadPacket(buf[datagramContextIDHeadroom:])
 			if err != nil {
 				packetBufferPool.Put(buf)
-				log.Printf("Failed to read from TUN device: %v", err)
-				if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
-					return
+				if readerCtx.Err() == nil {
+					readerErrors <- err
 				}
+				return
+			}
+			if readerCtx.Err() != nil {
+				packetBufferPool.Put(buf)
+				return
+			}
+			if n == 0 {
+				packetBufferPool.Put(buf)
 				continue
 			}
 			select {
-			case <-ctx.Done():
-				packetBufferPool.Put(buf)
-				return
 			case packetBufferChan <- buf[:n]:
+			default:
+				packetBufferPool.Put(buf)
 			}
+		}
+	}()
+	var packet []byte
+	defer func() {
+		if packet != nil {
+			packetBufferPool.Put(packet[:cap(packet)])
 		}
 	}()
 
@@ -260,11 +268,17 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			return
 		}
 
-		var packet []byte
-		if !cfg.AlwaysReconnect {
+		select {
+		case <-readerErrors:
+			return
+		default:
+		}
+		if !cfg.AlwaysReconnect && packet == nil {
 			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
 			select {
 			case <-ctx.Done():
+				return
+			case <-readerErrors:
 				return
 			case packet = <-packetBufferChan:
 				log.Printf("Detected outbound activity (%d bytes). Reconnecting...", len(packet))
@@ -361,6 +375,7 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 				}
 			}
 		}(packet)
+		packet = nil
 
 		go func() {
 			defer wg.Done()
@@ -385,7 +400,14 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			}
 		}()
 
-		err = <-errChan
+		deviceFailed := false
+		select {
+		case err = <-errChan:
+		case <-ctx.Done():
+			err = ctx.Err()
+		case err = <-readerErrors:
+			deviceFailed = true
+		}
 		log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
 
 		if cfg.OnDisconnect != "" {
@@ -398,22 +420,18 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		cancelPumps()
 		_ = ipConn.Close()
 
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(pumpShutdownGrace):
-			log.Printf("Pump shutdown grace of %s expired; a stale TUN reader may still be parked (readMu will serialize next cycle)", pumpShutdownGrace)
-		}
+		// The only device reader lives outside these pumps and keeps draining
+		// until all synchronous device writes have finished.
+		wg.Wait()
 
 		if tr != nil {
 			_ = tr.Close()
 		}
 		if udpConn != nil {
 			_ = udpConn.Close()
+		}
+		if deviceFailed {
+			return
 		}
 		if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
 			return
