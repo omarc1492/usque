@@ -79,7 +79,9 @@ func TestHTTPProxyDoesNotSendProxyCredentialsToOrigin(t *testing.T) {
 	req.Header.Set("Proxy-Connection", "keep-alive")
 	req.Header.Set("X-Test", "preserved")
 	result := httptest.NewRecorder()
-	handleHTTPProxy(result, req, stack, nil)
+	client := newTunnelHTTPClient(stack, nil, 0)
+	defer client.CloseIdleConnections()
+	handleHTTPProxy(result, req, client)
 	if result.Code != 204 {
 		t.Fatalf("proxy status=%d: %s", result.Code, result.Body.String())
 	}

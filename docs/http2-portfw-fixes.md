@@ -9,7 +9,7 @@ This fork is based on upstream usque v4.2.1 (6aa03fc97d12848dce34eedbd187fb1077b
 - Use a one-use standard Go HTTP transport for each HTTP/2 tunnel. Keep endpoint ECDSA public-key pinning, including with empty SNI; require h2 ALPN on the outer MASQUE connection. Closed/rejected tunnel streams release their sockets. Cancellation is tested with an actual flow-control-stalled sender.
 - Bind every forwarding listener before starting the tunnel. Roll back partial binds and report configuration/bind/accept failures through Cobra RunE. Stop accept loops on listener errors and observe unexpected maintenance termination.
 - Remove the unrelated startup HTTP request for local-only forwarding. Remote forwarding retains a context-bound 30-second activation request.
-- Strip Proxy-Authorization and Proxy-Connection from classic HTTP proxy requests before sending them to an origin.
+- Adopt [upstream PR #137](https://github.com/Diniboy1123/usque/pull/137) for application HTTP proxy handling: reuse clients, bound custom DNS lookups, share TCP relay handling, preserve authentication-disabled behavior, and strip hop-by-hop headers from requests and responses. This supersedes the fork's original two-header filter; the source commit and author are preserved.
 - Update compatible x/net, x/text, x/crypto and x/sys dependencies. The module prefers the reviewed Go 1.27.4 toolchain; workflow files remain inherited from upstream.
 
 ## Build and verify
@@ -23,9 +23,11 @@ go vet ./...
 go test -timeout 45s ./...
 ```
 
-There are 13 focused regression tests. They generate temporary dummy TLS keys and use local HTTP/2 servers or an in-process virtual network; they do not need a WARP registration or live Cloudflare access. Tests cover pin/ALPN rejection, socket cleanup, idle reconnects, failed-dial packet retention, synchronous reply draining, stalled-send cancellation, listener rollback/cancellation and origin header stripping. The original upstream code fails the socket-cleanup and idle-wakeup regressions.
+There are 16 focused regression tests: the fork's 13 tests plus PR #137's three authentication/header tests. They generate temporary dummy TLS keys and use local HTTP/2 servers or an in-process virtual network; they do not need a WARP registration or live Cloudflare access. Tests cover pin/ALPN rejection, socket cleanup, idle reconnects, failed-dial packet retention, synchronous reply draining, stalled-send cancellation, listener rollback/cancellation and origin header stripping. The original upstream code fails the socket-cleanup and idle-wakeup regressions.
 
-The reviewed Windows build passed these checks, source/binary govulncheck scans, and live fixed-destination TLS/HTTP2 forwarding checks on 2026-11-16. These observations do not establish long-term stability, full native-device/proxy coverage, or absence of vulnerabilities. The inherited CI workflow targets Linux; consult the fork's Actions results for actual run status. Its compiler selection is not a claim about the security-reviewed local artifact. Release metadata points to this fork. No fork release workflow has been run and no fork release assets have been published.
+The pre-adoption Windows build passed these checks, source/binary govulncheck scans, and live fixed-destination TLS/HTTP2 forwarding checks on 2026-11-16. These observations do not establish long-term stability, full native-device/proxy coverage, or absence of vulnerabilities. The inherited CI workflow targets Linux; consult the fork's Actions results for actual run status. Its compiler selection is not a claim about the security-reviewed local artifact. Release metadata points to this fork. No fork release workflow has been run and no fork release assets have been published.
+
+PR #137 integration passes the test suite and vet with Go 1.27.4 on Windows/amd64. It has not been deployed or rescanned for vulnerabilities. Client pooling, CONNECT relay and custom DNS behavior have not been fully exercised end to end; the prior build's live validation does not establish those behaviors.
 
 ## Scope and limits
 

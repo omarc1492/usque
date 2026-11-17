@@ -1,6 +1,6 @@
 # usque
 
-> Fork maintenance: this fork contains reviewed HTTP/2 forwarding lifecycle, startup and proxy-header fixes with 13 regression tests. See [the changes and validation scope](docs/http2-portfw-fixes.md). The reviewed local build uses Go 1.27.4. Build this fork from source; patched release binaries are not published yet.
+> Fork maintenance: this fork contains reviewed HTTP/2 forwarding lifecycle, startup and proxy-header fixes with 16 regression tests. See [the changes and validation scope](docs/http2-portfw-fixes.md). The reviewed local build uses Go 1.27.4. Build this fork from source; patched release binaries are not published yet.
 
 🥚➡️🍏🍎
 
