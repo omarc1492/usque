@@ -390,6 +390,9 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
 						return
 					}
+					if pumpCtx.Err() != nil {
+						return
+					}
 					log.Printf("Error reading from IP connection: %v, continuing...", err)
 					continue
 				}

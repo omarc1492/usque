@@ -295,6 +295,8 @@ func TestCancellationClosesStalledHTTP2Send(t *testing.T) {
 	for time.Now().Before(deadline) {
 		stack := make([]byte, 1<<20)
 		n := runtime.Stack(stack, true)
+		// The pinned x/net implementation exposes this frame while blocked on
+		// peer flow control; revisit this probe when updating that dependency.
 		if strings.Contains(string(stack[:n]), "awaitFlowControl") {
 			stalled = true
 			break
