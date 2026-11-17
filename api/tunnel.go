@@ -149,12 +149,6 @@ func NewWaterAdapter(iface *water.Interface) TunnelDevice {
 	return &WaterAdapter{iface: iface}
 }
 
-// pumpShutdownGrace bounds how long the supervisor waits for both forwarding
-// pumps to exit after an error before spawning a fresh pair. A device-side
-// pump may still be parked in a blocking TUN read during this window; the
-// readMu serializes any overlap with the next cycle's device reader.
-const pumpShutdownGrace = 2 * time.Second
-
 // CONNECT-IP context ID 0 is encoded as a one-byte QUIC varint. Reserving this
 // byte before packets lets connect-ip-go send outbound datagrams in place.
 const datagramContextIDHeadroom = 1
@@ -230,40 +224,74 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 		}
 	}
 
+	readerCtx, stopReader := context.WithCancel(context.Background())
+	defer stopReader()
 	packetBufferPool := NewNetBuffer(cfg.MTU + datagramContextIDHeadroom)
-
-	for {
-		if ctx.Err() != nil {
-			return
-		}
-
-		if !cfg.AlwaysReconnect {
-			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
+	type devicePacket struct {
+		buffer []byte
+		size   int
+		err    error
+	}
+	// Match wireguard/netstack's existing 1024-packet channel capacity. Never
+	// block the device reader on a full queue: injecting an incoming packet can
+	// synchronously produce a reply and wait for another device read.
+	packets := make(chan devicePacket, 1024)
+	// Device reads cannot be canceled per connection. Keep one reader for the
+	// whole device lifetime; its owner closes the device after cancellation.
+	go func() {
+		for {
 			buf := packetBufferPool.Get()
 			n, err := cfg.Device.ReadPacket(buf[datagramContextIDHeadroom:])
 			if err != nil {
-				packetBufferPool.Put(buf)
-				log.Printf("Failed to read from TUN device while waiting for activity: %v", err)
-				if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
-					return
+				select {
+				case <-readerCtx.Done():
+					packetBufferPool.Put(buf)
+				case packets <- devicePacket{buf, n, err}:
 				}
-				continue
+				return
 			}
-			packetBufferPool.Put(buf)
-			log.Printf("Detected outbound activity (%d bytes). Reconnecting...", n)
+			if readerCtx.Err() != nil {
+				packetBufferPool.Put(buf)
+				return
+			}
+			select {
+			case packets <- devicePacket{buf, n, nil}:
+			default:
+				packetBufferPool.Put(buf) // bounded IP queue; sender can retransmit
+			}
+		}
+	}()
+	var pending *devicePacket
+	defer func() {
+		if pending != nil {
+			packetBufferPool.Put(pending.buffer)
+		}
+	}()
+
+	for ctx.Err() == nil {
+		if !cfg.AlwaysReconnect && pending == nil {
+			log.Println("Tunnel idle. Waiting for outbound activity before reconnecting...")
+			select {
+			case <-ctx.Done():
+				return
+			case packet := <-packets:
+				pending = &packet
+			}
+			if pending.err != nil {
+				log.Printf("TUN read failed: %v", pending.err)
+				return
+			}
 		}
 
 		log.Printf("Establishing MASQUE connection to %s", cfg.Endpoint)
+		cycleCtx, cancelCycle := context.WithCancel(ctx)
 		udpConn, tr, ipConn, rsp, err := ConnectTunnel(
-			ctx,
-			cfg.TLSConfig,
+			cycleCtx, cfg.TLSConfig,
 			internal.DefaultQuicConfig(cfg.KeepalivePeriod, cfg.InitialPacketSize),
-			internal.ConnectURI,
-			cfg.Endpoint,
-			cfg.UseHTTP2,
+			internal.ConnectURI, cfg.Endpoint, cfg.UseHTTP2,
 		)
-		if err != nil {
-			log.Printf("Failed to connect tunnel: %v", err)
+		cleanup := func() {
+			cancelCycle()
 			if ipConn != nil {
 				_ = ipConn.Close()
 			}
@@ -273,28 +301,20 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			if udpConn != nil {
 				_ = udpConn.Close()
 			}
-			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+		}
+		if err != nil || rsp.StatusCode != 200 {
+			if err != nil {
+				log.Printf("Failed to connect tunnel: %v", err)
+			} else {
+				log.Printf("Tunnel connection failed: %s", rsp.Status)
+			}
+			cleanup()
+			if sleepCtx(ctx, cfg.ReconnectDelay) != nil {
 				return
 			}
 			continue
 		}
-		if rsp.StatusCode != 200 {
-			log.Printf("Tunnel connection failed: %s", rsp.Status)
-			_ = ipConn.Close()
-			if tr != nil {
-				_ = tr.Close()
-			}
-			if udpConn != nil {
-				_ = udpConn.Close()
-			}
-			if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
-				return
-			}
-			continue
-		}
-
 		log.Println("Connected to MASQUE server")
-
 		if cfg.OnConnect != "" {
 			env := cloneHookEnv(cfg.HookEnv)
 			env["USQUE_EVENT"] = "connect"
@@ -302,110 +322,82 @@ func MaintainTunnel(ctx context.Context, cfg MaintainTunnelConfig) {
 			RunHook(cfg.OnConnect, env)
 		}
 
-		errChan := make(chan error, 2)
-		pumpCtx, cancelPumps := context.WithCancel(ctx)
-		var wg sync.WaitGroup
-		var readMu sync.Mutex
-
-		wg.Add(2)
-
+		incomingError := make(chan error, 1)
+		incomingDone := make(chan struct{})
 		go func() {
-			defer wg.Done()
-			for {
-				if pumpCtx.Err() != nil {
-					return
-				}
-				buf := packetBufferPool.Get()
-				readMu.Lock()
-				n, err := cfg.Device.ReadPacket(buf[datagramContextIDHeadroom:])
-				readMu.Unlock()
-				if err != nil {
-					packetBufferPool.Put(buf)
-					errChan <- fmt.Errorf("failed to read from TUN device: %w", err)
-					return
-				}
-				if pumpCtx.Err() != nil {
-					packetBufferPool.Put(buf)
-					return
-				}
-				icmp, err := ipConn.WritePacketBuffer(buf, datagramContextIDHeadroom, n)
-				if err != nil {
-					packetBufferPool.Put(buf)
-					if errors.As(err, new(*connectip.CloseError)) {
-						errChan <- fmt.Errorf("connection closed while writing to IP connection: %w", err)
-						return
-					}
-					log.Printf("Error writing to IP connection: %v, continuing...", err)
-					continue
-				}
-				packetBufferPool.Put(buf)
-
-				if len(icmp) > 0 {
-					if err := cfg.Device.WritePacket(icmp); err != nil {
-						if errors.As(err, new(*connectip.CloseError)) {
-							errChan <- fmt.Errorf("connection closed while writing ICMP to TUN device: %w", err)
-							return
-						}
-						log.Printf("Error writing ICMP to TUN device: %v, continuing...", err)
-					}
-				}
-			}
-		}()
-
-		go func() {
-			defer wg.Done()
+			defer close(incomingDone)
+			// Also unblock an outbound send if the incoming stream dies.
+			defer ipConn.Close()
 			for {
 				packet, err := ipConn.ReadPacketZeroCopy(true)
 				if err != nil {
-					if cfg.UseHTTP2 {
-						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
+					if cfg.UseHTTP2 || errors.As(err, new(*connectip.CloseError)) {
+						incomingError <- fmt.Errorf("read from IP connection: %w", err)
 						return
 					}
-					if errors.As(err, new(*connectip.CloseError)) {
-						errChan <- fmt.Errorf("connection closed while reading from IP connection: %w", err)
-						return
-					}
-					log.Printf("Error reading from IP connection: %v, continuing...", err)
+					log.Printf("Error reading from IP connection: %v", err)
 					continue
 				}
 				if err := cfg.Device.WritePacket(packet); err != nil {
-					errChan <- fmt.Errorf("failed to write to TUN device: %w", err)
+					incomingError <- fmt.Errorf("write to TUN device: %w", err)
 					return
 				}
 			}
 		}()
-
-		err = <-errChan
-		log.Printf("Tunnel connection lost: %v. Reconnecting...", err)
-
+		stopClose := context.AfterFunc(ctx, func() { _ = ipConn.Close() })
+		var connectionError error
+		deviceFailed := false
+		for connectionError == nil && ctx.Err() == nil {
+			if pending == nil {
+				select {
+				case <-ctx.Done():
+				case connectionError = <-incomingError:
+				case packet := <-packets:
+					pending = &packet
+				}
+			}
+			if pending == nil || connectionError != nil || ctx.Err() != nil {
+				continue
+			}
+			if pending.err != nil {
+				connectionError = pending.err
+				deviceFailed = true
+				break
+			}
+			// A failed attempted IP send is not replayed: completion is ambiguous
+			// and the CONNECT-IP writer mutates TTL / HopLimit in place.
+			icmp, writeErr := ipConn.WritePacketBuffer(pending.buffer, datagramContextIDHeadroom, pending.size)
+			packetBufferPool.Put(pending.buffer)
+			pending = nil
+			if writeErr != nil {
+				if cfg.UseHTTP2 || errors.As(writeErr, new(*connectip.CloseError)) {
+					connectionError = writeErr
+				} else {
+					log.Printf("Error writing to IP connection: %v", writeErr)
+				}
+				continue
+			}
+			if len(icmp) > 0 {
+				if err := cfg.Device.WritePacket(icmp); err != nil {
+					connectionError = err
+					deviceFailed = true
+				}
+			}
+		}
+		stopClose()
+		cleanup()
+		<-incomingDone
+		if ctx.Err() != nil || deviceFailed {
+			return
+		}
+		log.Printf("Tunnel connection lost: %v. Reconnecting...", connectionError)
 		if cfg.OnDisconnect != "" {
 			env := cloneHookEnv(cfg.HookEnv)
 			env["USQUE_EVENT"] = "disconnect"
 			env["USQUE_ENDPOINT"] = cfg.Endpoint.String()
 			RunHook(cfg.OnDisconnect, env)
 		}
-
-		cancelPumps()
-		_ = ipConn.Close()
-
-		done := make(chan struct{})
-		go func() {
-			wg.Wait()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(pumpShutdownGrace):
-			log.Printf("Pump shutdown grace of %s expired; a stale TUN reader may still be parked (readMu will serialize next cycle)", pumpShutdownGrace)
-		}
-
-		if tr != nil {
-			_ = tr.Close()
-		}
-		if udpConn != nil {
-			_ = udpConn.Close()
-		}
-		if sleepErr := sleepCtx(ctx, cfg.ReconnectDelay); sleepErr != nil {
+		if sleepCtx(ctx, cfg.ReconnectDelay) != nil {
 			return
 		}
 	}

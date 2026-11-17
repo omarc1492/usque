@@ -1,5 +1,7 @@
 # usque
 
+> Fork maintenance: this fork contains reviewed HTTP/2 forwarding lifecycle, startup and proxy-header fixes with 13 regression tests. See [the changes and validation scope](docs/http2-portfw-fixes.md). The reviewed local build uses Go 1.27.4. Build this fork from source; patched release binaries are not published yet.
+
 🥚➡️🍏🍎
 
 Usque is an open-source reimplementation of the Cloudflare WARP client's MASQUE mode. It leverages the [Connect-IP (RFC 9484)](https://datatracker.ietf.org/doc/rfc9484/) protocol and comes with many operation modes including a native tunnel, SOCKS5 and HTTP proxies, and faster TCP-only L4 proxy variants.

@@ -401,6 +401,8 @@ func handleHTTPProxy(w http.ResponseWriter, r *http.Request, tunNet *netstack.Ne
 		return
 	}
 	req.Header = r.Header.Clone()
+	req.Header.Del("Proxy-Authorization")
+	req.Header.Del("Proxy-Connection")
 
 	resp, err := client.Do(req)
 	if err != nil {
